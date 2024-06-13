@@ -5,14 +5,17 @@ declare(strict_types=1);
 namespace TheCodingMachine\GraphQLite;
 
 use GraphQL\Type\SchemaConfig;
+use Kcs\ClassFinder\Finder\ClassMapFinder;
 use Kcs\ClassFinder\Finder\ComposerFinder;
 use Kcs\ClassFinder\Finder\FinderInterface;
 use MyCLabs\Enum\Enum;
 use PackageVersions\Versions;
 use Psr\Container\ContainerInterface;
 use Psr\SimpleCache\CacheInterface;
+use ReflectionClass;
 use Symfony\Component\Cache\Adapter\Psr16Adapter;
 use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
+use Symfony\Contracts\Cache\ItemInterface;
 use TheCodingMachine\GraphQLite\Cache\ClassBoundCacheContractFactoryInterface;
 use TheCodingMachine\GraphQLite\Mappers\CompositeTypeMapper;
 use TheCodingMachine\GraphQLite\Mappers\GlobTypeMapper;
@@ -60,9 +63,14 @@ use TheCodingMachine\GraphQLite\Utils\Namespaces\NamespaceFactory;
 
 use function array_map;
 use function array_reverse;
+use function assert;
 use function class_exists;
+use function hash;
+use function json_encode;
 use function md5;
 use function substr;
+
+use const JSON_THROW_ON_ERROR;
 
 /**
  * A class to help getting started with GraphQLite.
@@ -336,7 +344,31 @@ class SchemaFactory
         $typeRegistry = new TypeRegistry();
         $finder = $this->finder ?? new ComposerFinder();
 
-        $namespaceFactory = new NamespaceFactory($namespacedCache, $finder, $this->globTTL);
+        $namespaces = [
+            ...$this->typeNamespaces,
+            ...$this->controllerNamespaces,
+        ];
+        $cacheKey = 'GraphQLite_ClassMap_' . hash('sha256', json_encode($namespaces, JSON_THROW_ON_ERROR));
+
+        $classmap = $symfonyCache->get($cacheKey, function (ItemInterface $item) use ($finder, &$namespaces) {
+            $classmap = [];
+            $finder = (clone $finder)
+                ->inNamespace($namespaces)
+                ->skipBogonFiles();
+
+            /** @var class-string $class */
+            foreach ($finder as $class => $refClass) {
+                assert($refClass instanceof ReflectionClass);
+                $classmap[$class] = $refClass->getFileName() ?: '';
+            }
+
+            $item->expiresAfter($this->globTTL);
+
+            return $classmap;
+        });
+
+        $classmapFinder = new ClassMapFinder($classmap);
+        $namespaceFactory = new NamespaceFactory($namespacedCache, $classmapFinder, $this->globTTL);
         $nsList = array_map(
             static fn (string $namespace) => $namespaceFactory->createNamespace($namespace),
             $this->typeNamespaces,
@@ -487,7 +519,7 @@ class SchemaFactory
                 $this->container,
                 $annotationReader,
                 $namespacedCache,
-                $finder,
+                $classmapFinder,
                 $this->globTTL,
             );
         }
